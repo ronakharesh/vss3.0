@@ -10,9 +10,11 @@
 # ─── Quick Start ──────────────────────────────────────────────────────────────
 #
 #   cp k8-deployment/.env.example k8-deployment/.env
-#   # Fill in: NGC_CLI_API_KEY, YOUR_REGISTRY, NODE_IP
+#   # Fill in TWO values only: NGC_CLI_API_KEY and NODE_IP
 #   chmod +x deploy-vss-3.1.3.sh
 #   ./deploy-vss-3.1.3.sh
+#
+#   No registry setup needed — the script starts a local one automatically.
 #
 # ─── All Options ──────────────────────────────────────────────────────────────
 #
@@ -41,19 +43,17 @@
 #
 # ─── .env Configuration (k8-deployment/.env) ─────────────────────────────────
 #
-#   Required:
-#   NGC_CLI_API_KEY   NGC API key (nvapi- key) — image pulls + model downloads
-#   YOUR_REGISTRY     Docker registry for custom images (e.g. localhost:5000)
-#   NODE_IP           This machine's IP address (used for NodePort URLs)
+#   Required (only these two):
+#   NGC_CLI_API_KEY   NGC API key (nvapi- key) — NIM image pulls + model downloads
+#   NODE_IP           This machine's IP address (for NodePort service URLs)
 #
-#   GPU assignment (defaults shown — change to match your machine):
-#   RT_CV_DEVICE_ID   GPU index for DeepStream (must NOT have MPS server)
-#   VLM_DEVICE_ID     GPU index for VLM NIM (Cosmos-Reason2-8B)
-#   LLM_DEVICE_ID     GPU hint for LLM NIM (device plugin overrides for TP=2)
-#   NUM_SENSORS       Number of concurrent RTSP camera streams (default: 1)
-#
-#   Optional:
-#   NAMESPACE         K8s namespace (default: vss-alerts)
+#   Optional (all have working defaults):
+#   YOUR_REGISTRY     Image registry — defaults to localhost:5000 (auto-started)
+#   RT_CV_DEVICE_ID   GPU for DeepStream (default 3 — must NOT have MPS server)
+#   VLM_DEVICE_ID     GPU for VLM NIM Cosmos-8B (default 2)
+#   LLM_DEVICE_ID     GPU hint for LLM NIM Nemotron-9B (default 1, TP=2 auto)
+#   NUM_SENSORS       Concurrent RTSP streams (default 1)
+#   NAMESPACE         K8s namespace (default vss-alerts)
 #
 # ─── GPU Requirements ─────────────────────────────────────────────────────────
 #
@@ -139,14 +139,37 @@ load_env() {
   # shellcheck disable=SC1090
   source "$ENV_FILE"
   : "${NGC_CLI_API_KEY:?NGC_CLI_API_KEY must be set in k8-deployment/.env}"
-  : "${YOUR_REGISTRY:?YOUR_REGISTRY must be set in k8-deployment/.env}"
   : "${NODE_IP:?NODE_IP must be set in k8-deployment/.env}"
+  # YOUR_REGISTRY defaults to localhost:5000 — script starts the registry automatically
+  YOUR_REGISTRY="${YOUR_REGISTRY:-localhost:5000}"
   NAMESPACE="${NAMESPACE:-vss-alerts}"
   RT_CV_DEVICE_ID="${RT_CV_DEVICE_ID:-3}"
   LLM_DEVICE_ID="${LLM_DEVICE_ID:-1}"
   VLM_DEVICE_ID="${VLM_DEVICE_ID:-2}"
   NUM_SENSORS="${NUM_SENSORS:-1}"
   MODELS_DIR="${SCRIPT_DIR}/deployments/data-dir/models"
+}
+
+# ─── Local registry (auto-managed) ───────────────────────────────────────────
+# When YOUR_REGISTRY=localhost:5000 (the default), the script starts a local
+# Docker registry automatically. k3s on the same machine pulls from it with
+# no TLS config needed. Users never need to set up an external registry.
+ensure_registry() {
+  if [[ "$YOUR_REGISTRY" != "localhost:5000" ]]; then
+    return  # using an external registry — user manages it
+  fi
+  if docker ps --format '{{.Names}}' | grep -q "^local-registry$"; then
+    info "Local registry already running at localhost:5000"
+    return
+  fi
+  if docker ps -a --format '{{.Names}}' | grep -q "^local-registry$"; then
+    info "Restarting stopped local registry..."
+    docker start local-registry
+  else
+    info "Starting local Docker registry on localhost:5000..."
+    docker run -d -p 5000:5000 --restart=always --name local-registry registry:2
+  fi
+  info "Local registry ready at localhost:5000"
 }
 
 # ─── Prerequisite check ───────────────────────────────────────────────────────
@@ -237,17 +260,6 @@ install_k3s() {
 
   info "GPU Operator ready."
   kubectl get nodes -o custom-columns="NAME:.metadata.name,GPUs:.status.capacity.nvidia\.com/gpu"
-
-  # ── Start local Docker registry on localhost:5000 ──────────────────────────
-  # k3s on the same machine can pull from localhost:5000 without TLS config.
-  # This is the default YOUR_REGISTRY in .env.example.
-  if ! docker ps --format '{{.Names}}' | grep -q "^local-registry$"; then
-    info "Starting local Docker registry on localhost:5000..."
-    docker run -d -p 5000:5000 --restart=always --name local-registry registry:2
-    info "Local registry running at localhost:5000"
-  else
-    info "Local registry already running at localhost:5000"
-  fi
 }
 
 # ─── Namespace + secrets ─────────────────────────────────────────────────────
@@ -543,6 +555,7 @@ teardown() {
 
 # ─── Full deploy ──────────────────────────────────────────────────────────────
 full_deploy() {
+  ensure_registry
   check_prereqs
   setup_namespace
   if [[ "${SKIP_BUILD:-0}" == "1" ]]; then
