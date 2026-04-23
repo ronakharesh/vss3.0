@@ -2033,6 +2033,8 @@ spec:
               value: "CHANGE_ME_LLM_DEVICE_ID"
             - name: NIM_MAX_MODEL_LEN
               value: "32768"
+            - name: UCX_IB_DISABLE
+              value: "1"
           volumeMounts:
             - name: nim-cache
               mountPath: /opt/nim/.cache

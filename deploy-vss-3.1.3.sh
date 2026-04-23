@@ -94,6 +94,10 @@
 #     ~34 GiB on a single L40S. Fix: nvidia.com/gpu: 2 → NIM auto-selects TP=2
 #   • perception-sdr Redis localhost:6379 errors are non-critical (SDR uses VST
 #     REST API as stream source via WDM_INITIALIZE_FROM_VST=true)
+#   • LLM NIM UCX/RDMA error: "ibv_reg_mr failed: Cannot allocate memory /
+#     Please set max locked memory (ulimit -l) to unlimited" — UCX tries to pin
+#     memory for InfiniBand RDMA but container memlock limit is 8 MB. Fix:
+#     UCX_IB_DISABLE=1 forces TCP fallback, no memlock needed. Already set.
 #
 # =============================================================================
 set -euo pipefail
