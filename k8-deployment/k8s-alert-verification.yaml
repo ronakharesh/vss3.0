@@ -1,0 +1,2541 @@
+# =============================================================================
+# NVIDIA VSS Alert Verification Workflow — Kubernetes Manifests
+# Mode: verification (2d_cv), L40S hardware profile
+#
+# GPU layout (request adjusts per your cluster):
+#   GPU 0  — RT_CV_DEVICE_ID   : DeepStream perception
+#   GPU 1  — LLM_DEVICE_ID     : nvidia-nemotron-nano-9b-v2
+#   GPU 2  — VLM_DEVICE_ID     : cosmos-reason2-8b
+#
+# Prerequisites:
+#   • NVIDIA GPU Operator + device plugin installed
+#   • kubectl + helm available, kubeconfig set
+#   • nvcr.io login secret in namespace (see imagePullSecrets below)
+#   • Dynamic PV provisioner (e.g., rancher/local-path-provisioner)
+#   • ≥ 150 GB disk, ≥ 100 GB free GPU VRAM across 3+ GPUs
+#
+# Custom images — build and push BEFORE applying this manifest:
+#   YOUR_REGISTRY/vss-elasticsearch:3.1.0
+#     docker build -f deployments/foundational/Dockerfiles/elasticsearch.Dockerfile .
+#   YOUR_REGISTRY/vss-elastic-init:3.1.0
+#     docker build -f deployments/foundational/Dockerfiles/elastic-init.Dockerfile .
+#   YOUR_REGISTRY/vss-broker-health-check:3.1.0
+#     docker build -f deployments/foundational/Dockerfiles/kafka-health-check.Dockerfile .
+#   YOUR_REGISTRY/vss-perception-alerts:3.1.0
+#     docker build -f deployments/developer-workflow/dev-profile-alerts/Dockerfiles/perception.Dockerfile \
+#       --build-arg PERCEPTION_IMAGE=nvcr.io/nvidia/vss-core/vss-rt-cv \
+#       --build-arg PERCEPTION_TAG=3.1.0 \
+#       deployments/developer-workflow/dev-profile-alerts
+#   YOUR_REGISTRY/vss-kibana-init-alerts:3.1.0
+#     docker build -f deployments/developer-workflow/dev-profile-alerts/Dockerfiles/kibana-dashboard.Dockerfile \
+#       deployments/developer-workflow/dev-profile-alerts
+#
+# Network mapping (Docker host-mode → K8s ClusterIP service names):
+#   localhost:9092  → kafka:9092
+#   localhost:9200  → elasticsearch:9200
+#   localhost:6379  → redis:6379
+#   localhost:5601  → kibana:5601
+#   localhost:6006  → phoenix:6006
+#   localhost:30888 → vst-ingress:30888
+#   localhost:31000 → nvstreamer:31000
+#   localhost:30081 → llm-nim:8000
+#   localhost:30082 → vlm-nim:8000
+#   localhost:8000  → vss-agent:8000
+#   localhost:8001  → vst-mcp:8001
+#   localhost:9901  → vss-agent-mcp:9901
+#   localhost:8081  → video-analytics-api:8081
+#   localhost:3000  → vss-agent-ui:3000
+#
+# Usage:
+#   # 1. Create namespace and secrets
+#   kubectl create namespace vss-alerts
+#   kubectl -n vss-alerts create secret docker-registry nvcr-secret \
+#     --docker-server=nvcr.io \
+#     --docker-username="\$oauthtoken" \
+#     --docker-password=<YOUR_NGC_CLI_API_KEY>
+#
+#   # 2. Edit PLACEHOLDER values in this file (search for CHANGE_ME)
+#
+#   # 3. Apply
+#   kubectl apply -f k8s-alert-verification.yaml
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# 1. NAMESPACE
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: vss-alerts
+
+---
+# ---------------------------------------------------------------------------
+# 2. SECRETS
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Secret
+metadata:
+  name: vss-secrets
+  namespace: vss-alerts
+type: Opaque
+stringData:
+  NGC_CLI_API_KEY: "CHANGE_ME_YOUR_NGC_CLI_API_KEY"
+  NVIDIA_API_KEY: ""      # needed only for remote NIM endpoints
+  OPENAI_API_KEY: ""      # needed only for OpenAI remote endpoints
+  HF_TOKEN: ""            # optional Hugging Face token
+  POSTGRES_PASSWORD: "vst"
+
+---
+# ---------------------------------------------------------------------------
+# 3. PERSISTENT VOLUME CLAIMS
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: kafka-data
+  namespace: vss-alerts
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 20Gi
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: elasticsearch-data
+  namespace: vss-alerts
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 50Gi
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: redis-data
+  namespace: vss-alerts
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 5Gi
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: phoenix-data
+  namespace: vss-alerts
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 10Gi
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-data
+  namespace: vss-alerts
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 20Gi
+
+---
+# VST data storage: clip_storage, vst_data, recordings
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vst-data
+  namespace: vss-alerts
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 100Gi
+
+---
+# models-data is served from a hostPath (models already on disk from Docker deployment)
+# hostPath: /home/shadeform/video-search-and-summarization/deployments/data-dir/models
+# No PVC needed — perception-alerts mounts this hostPath directly.
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nvstreamer-data
+  namespace: vss-alerts
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 50Gi
+
+# NIM caches use hostPath from existing Docker volumes — no PVCs needed.
+# LLM cache: /var/lib/docker/volumes/mdx_nvidia_nemotron_nano_9b_v2_cache/_data
+# VLM cache: /var/lib/docker/volumes/mdx_cosmos_reason2_8b_cache/_data
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: video-analytics-api-data
+  namespace: vss-alerts
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 10Gi
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: perception-storage
+  namespace: vss-alerts
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 10Gi
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: agent-eval
+  namespace: vss-alerts
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 10Gi
+
+---
+# ---------------------------------------------------------------------------
+# 4. CONFIGMAPS
+# ---------------------------------------------------------------------------
+# Config files pulled from deployments/developer-workflow/dev-profile-alerts/
+# Replace service URLs from localhost → K8s service names.
+# NOTE: Mount these as files via subPath in the Deployment volumes section.
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: behavior-analytics-config
+  namespace: vss-alerts
+data:
+  # Source: vss-behavior-analytics/configs/vss-behavior-analytics-kafka-config.json
+  # Updated: brokers localhost:9092 → kafka:9092
+  vss-behavior-analytics-config.json: |
+    {
+      "kafka": {
+        "brokers": "kafka:9092",
+        "topics": [
+          {"name": "raw", "value": "mdx-raw"},
+          {"name": "notification", "value": "mdx-notification"},
+          {"name": "incidents", "value": "mdx-incidents"}
+        ],
+        "consumer": {
+          "autoOffsetReset": "latest",
+          "enableAutoCommit": false,
+          "maxPollIntervalMs": 900000,
+          "maxPartitionFetchBytes": 10485760,
+          "fetchMaxBytes": 104857600,
+          "maxPollRecords": 10000,
+          "timeout": 0.01
+        },
+        "producer": {"lingerMs": 0},
+        "group": "mdx-spatial-analytics-2d-app"
+      },
+      "sensors": [],
+      "app": [
+        {"name": "playbackLoop", "value": "10000"},
+        {"name": "playbackFilterEmptyObjects", "value": "true"},
+        {"name": "playbackStartUpDelaySec", "value": "90"},
+        {"name": "sourceType", "value": "kafka"},
+        {"name": "sinkType", "value": "kafka"},
+        {"name": "numWorkersForIncidentGeneration", "value": "2"},
+        {"name": "fovCountViolationIncidentEnable", "value": "true"},
+        {"name": "fovCountViolationIncidentObjectThreshold", "value": "1"},
+        {"name": "fovCountViolationIncidentThreshold", "value": "2"},
+        {"name": "fovCountViolationIncidentExpirationWindow", "value": "0.5"},
+        {"name": "fovCountViolationIncidentObjectType", "value": "person"}
+      ]
+    }
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: video-analytics-api-config
+  namespace: vss-alerts
+data:
+  # Source: vss-video-analytics-api/configs/video-analytics-api-kafka-config.json
+  # Updated: localhost:9200 → elasticsearch:9200, localhost:9092 → kafka:9092
+  video-analytics-api-config.json: |
+    {
+      "server": {
+        "port": 8081,
+        "configs": [
+          {"name": "postBodySizeLimit", "value": "50mb"},
+          {"name": "amrRetentionInSec", "value": "3"},
+          {"name": "inSimulationMode", "value": "false"}
+        ]
+      },
+      "elasticsearch": {
+        "node": "http://elasticsearch:9200",
+        "indexPrefix": "mdx-",
+        "rawIndex": "mdx-raw-*"
+      },
+      "kafka": {
+        "brokers": ["kafka:9092"]
+      }
+    }
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alert-verification-config
+  namespace: vss-alerts
+data:
+  # Source: vlm-as-verifier/configs/config.yml
+  # Updated: localhost:* → k8s service names; ${VLM_BASE_URL}/${VLM_NAME} pre-substituted
+  # The container's env-substitute.py is skipped in K8s (command override below);
+  # this config is mounted directly at /app/runtime/config.yml (the post-substitution path).
+  config.yml: |
+    ALERT_REVIEW_MEDIA_BASE_DIR: ""
+
+    vst_config:
+      recording_check_max_attempts: 3
+      base_url: "http://vst-ingress:30888"
+      sensor_list_endpoint: "/vst/api/v1/sensor/streams"
+      add_overlay: false
+      segment_anchor: "end"
+      segment_duration_seconds: 10
+      storage:
+        base_url: "http://vst-ingress:30888"
+        media_file_path_by_id_endpoint: "/api/v1/storage/file/path"
+
+    kafka:
+      bootstrap_servers: "kafka:9092"
+      group_id: 'kafka-incidents-dumper'
+      max_poll_records: 10
+      auto_offset_reset: 'latest'
+      enable_auto_commit: false
+      max_poll_interval_ms: 600000
+      session_timeout_ms: 45000
+      heartbeat_interval_ms: 15000
+      poll_timeout: 5
+      message_type: "Incident"
+      enhanced_anomaly_topic: "alert-bridge-enhanced-alerts"
+      incidents_topic: "alert-bridge-incidents"
+
+    vlm:
+      base_url: http://vlm-nim:8000/v1
+      model: "nvidia/cosmos-reason2-8b"
+      max_tokens: 4096
+      min_pixels: 1568
+      max_pixels: 3960000
+      enable_sampling: true
+      sampling_fps: 4
+
+    event_bridge:
+      sourceType: "kafka"
+      sinkType: "kafka"
+      kafka_source:
+        group_id: 'alert-bridge-vlm-group'
+        topics:
+          incident: 'mdx-incidents'
+      redis_source:
+        host: "redis"
+        port: 6379
+        db: 0
+        dedup_ttl_seconds: 5
+        protect_confirmed_verdicts:
+          enabled: true
+          ttl_seconds: 600
+        end_time_delta_filter:
+          enabled: true
+          threshold_seconds: 3
+          ttl_seconds: 3600
+        end_time_in_dedup_key_categories: []
+        streams:
+          anomaly_stream: "alert-bridge-input-stream"
+          heartbeat_stream: "alert-bridge-heartbeats-stream"
+        consumer_group: "vlm_agents_group"
+        consumer_config:
+          block_time: 10
+          count: 1
+          batch_size: 1
+      redis_sink:
+        host: "redis"
+        port: 6379
+        db: 0
+        streams:
+          enhanced_anomaly_stream: "alert-bridge-enhanced-stream"
+          incidents_stream: "alert-bridge-incidents-stream"
+
+    prompt:
+      prefer_payload_prompt: false
+      override_prompts_on_start: true
+
+    alert_type_config_file: "alert_type_config.json"
+
+    alert_agent:
+      num_workers: 10
+      max_allowed_stream_size: 2
+      default_stream_interval: 1
+      vst_pass_through_mode: false
+      include_latency_info: false
+
+    elastic:
+      enabled: true
+      hosts:
+        - http://elasticsearch:9200
+
+    vlm_enhanced_sink:
+      incident:
+        type: "elastic"
+        elastic:
+          index: "mdx-vlm-incidents"
+      alert:
+        type: "elastic"
+        elastic:
+          index: "mdx-vlm-alerts"
+
+    logging:
+      level: "INFO"
+      format: "%(asctime)s - %(threadName)s - %(name)s - %(levelname)s - %(message)s"
+      third_party_level: "WARNING"
+
+  # Source: vlm-as-verifier/configs/alert_type_config.json (verbatim)
+  alert_type_config.json: |
+    {
+      "version": "1.0",
+      "alerts": [
+        {
+          "alert_type": "FOV Count Violation",
+          "output_category": "Ladder PPE Violation",
+          "prompts": {
+            "system": "You are a helpful assistant.",
+            "user": "Is anyone on the ladder without a hardhat and safety vest? \nAnswer yes or no."
+          }
+        }
+      ]
+    }
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nvstreamer-config
+  namespace: vss-alerts
+data:
+  # Source: nvstreamer/configs/vst-config.json
+  # Updated: elasticsearch localhost → service name
+  vst-config.json: |
+    {
+      "server": {
+        "httpPort": 31000,
+        "rtspPort": 31554,
+        "webrtcPortRangeStart": 30001,
+        "webrtcPortRangeEnd": 30100,
+        "rtpUdpPortRangeStart": 31000,
+        "rtpUdpPortRangeEnd": 31200,
+        "maxWebrtcConnectionsIn": 8,
+        "maxWebrtcConnectionsOut": 8
+      },
+      "storage": {
+        "monitoringThresholdPercent": 95
+      },
+      "elasticsearch": {
+        "host": "elasticsearch:9200",
+        "indexPattern": "mdx-raw*"
+      }
+    }
+  # Source: nvstreamer/configs/vst-storage.json
+  vst-storage.json: |
+    {
+      "storage": {
+        "videoDir": "/home/vst/vst_release/streamer_videos",
+        "dataDir": "/home/vst/vst_release/vst_data",
+        "maxSizeMB": 40960
+      }
+    }
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-config
+  namespace: vss-alerts
+data:
+  redis.conf: |
+    save 900 1
+    save 300 10
+    save 60 10000
+    maxmemory-policy noeviction
+    loglevel notice
+    logfile "/log/redis.log"
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sdr-config
+  namespace: vss-alerts
+data:
+  # Source: sdr/docker_cluster_config.json
+  # Updated: localhost:9010 → vst-stream-processing:9010
+  docker_cluster_config.json: |
+    {
+      "mdx-ds-01": {
+        "provisioning_address": "vst-stream-processing:9010",
+        "process_type": "docker"
+      }
+    }
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vss-agent-mcp-config
+  namespace: vss-alerts
+data:
+  # Source: vss-agent/configs/va_mcp_server_config.yml
+  # Updated: ${HOST_IP}:30888 → vst-ingress:30888; ${HOST_IP}:9200 → elasticsearch:9200
+  va_mcp_server_config.yml: |
+    functions:
+      vst_sensor_list:
+        _type: vst.sensor_list
+        vst_internal_url: http://vst-ingress:30888
+
+    function_groups:
+      video_analytics:
+        _type: video_analytics
+        es_url: "http://elasticsearch:9200"
+        index_prefix: "mdx-"
+        vlm_verified: true
+        vst_sensor_list_tool: vst_sensor_list
+        embedding_model_name: "sentence-transformers/all-MiniLM-L6-v2"
+        include:
+        - get_incident
+        - get_incidents
+        - get_sensor_ids
+        - get_places
+        - get_fov_histogram
+        - get_average_speeds
+        - analyze
+
+    llms:
+      nim_llm:
+        _type: nim
+        model_name: meta/llama-3.1-70b-instruct
+        temperature: 0.0
+        max_tokens: 1024
+
+    workflow:
+      _type: react_agent
+      tool_names: [video_analytics]
+      llm_name: nim_llm
+      verbose: true
+      parse_agent_response_max_retries: 3
+
+---
+# ---------------------------------------------------------------------------
+# 5. INIT JOBS
+# ---------------------------------------------------------------------------
+
+# Job: wait for Kafka, create required topics
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kafka-topic-init
+  namespace: vss-alerts
+spec:
+  template:
+    spec:
+      restartPolicy: OnFailure
+      imagePullSecrets:
+        - name: nvcr-secret
+      initContainers:
+        - name: wait-for-kafka
+          image: confluentinc/cp-kafka:8.1.1
+          command:
+            - sh
+            - -c
+            - |
+              until kafka-topics --bootstrap-server kafka:9092 --list > /dev/null 2>&1; do
+                echo "Waiting for Kafka..."; sleep 5
+              done
+              echo "Kafka is ready"
+      containers:
+        - name: topic-init
+          image: confluentinc/cp-kafka:8.1.1
+          command:
+            - sh
+            - -c
+            - |
+              TOPICS="mdx-raw mdx-bev mdx-space-utilization mdx-alerts mdx-behavior \
+                mdx-behavior-plus mdx-frames mdx-mtmc mdx-rtls mdx-rtls-region-1 \
+                mdx-amr mdx-vlm-alerts mdx-notification mdx-events mdx-incidents \
+                mdx-vlm-incidents mdx-vlm mdx-embed mdx-embed-filtered"
+              for TOPIC in $TOPICS; do
+                kafka-topics --bootstrap-server kafka:9092 \
+                  --create --if-not-exists \
+                  --topic $TOPIC \
+                  --partitions 8 \
+                  --replication-factor 1 \
+                  --config retention.ms=14400000
+                echo "Topic $TOPIC created/verified"
+              done
+
+---
+# Job: initialise Elasticsearch ILM policy, index templates, ingest pipelines
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: elasticsearch-init
+  namespace: vss-alerts
+spec:
+  template:
+    spec:
+      restartPolicy: OnFailure
+      imagePullSecrets:
+        - name: nvcr-secret
+      initContainers:
+        - name: wait-for-es
+          image: curlimages/curl:8.5.0
+          command:
+            - sh
+            - -c
+            - |
+              until curl -sf http://elasticsearch:9200/_cluster/health; do
+                echo "Waiting for Elasticsearch..."; sleep 5
+              done
+      containers:
+        - name: elastic-init
+          # Build: docker build -f deployments/foundational/Dockerfiles/elastic-init.Dockerfile .
+          image: CHANGE_ME_YOUR_REGISTRY/vss-elastic-init:3.1.0
+          env:
+            - name: BP_PROFILE
+              value: "bp_developer_alerts"
+            - name: ELASTICSEARCH_CONNECTION_MAX_ATTEMPTS
+              value: "20"
+            - name: ELASTICSEARCH_ILM_MIN_AGE
+              value: "4h"
+            - name: ELASTICSEARCH_RTVI_CV_EMBEDDINGS_DIM
+              value: "1536"
+            - name: ELASTICSEARCH_VISION_LLM_EMBEDDINGS_DIM
+              value: "768"
+
+---
+# Job: import Kibana dashboards
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kibana-init
+  namespace: vss-alerts
+spec:
+  template:
+    spec:
+      restartPolicy: OnFailure
+      imagePullSecrets:
+        - name: nvcr-secret
+      initContainers:
+        - name: wait-for-kibana
+          image: curlimages/curl:8.5.0
+          command:
+            - sh
+            - -c
+            - |
+              until curl -sf http://kibana:5601/api/status; do
+                echo "Waiting for Kibana..."; sleep 5
+              done
+      containers:
+        - name: kibana-dashboard
+          # Build: docker build -f deployments/developer-workflow/dev-profile-alerts/Dockerfiles/kibana-dashboard.Dockerfile \
+          #          deployments/developer-workflow/dev-profile-alerts
+          image: CHANGE_ME_YOUR_REGISTRY/vss-kibana-init-alerts:3.1.0
+          command:
+            - bash
+            - -c
+            - |
+              sed -i 's|localhost:9200|elasticsearch:9200|g; s|localhost:5601|kibana:5601|g' /opt/mdx/init-scripts/kibana-import-dashboard.sh
+              exec bash /opt/mdx/init-scripts/kibana-import-dashboard.sh
+          env:
+            - name: KIBANA_URL
+              value: "http://kibana:5601"
+
+---
+# ---------------------------------------------------------------------------
+# 6. INFRASTRUCTURE DEPLOYMENTS + SERVICES
+# ---------------------------------------------------------------------------
+
+# ── Kafka ──────────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kafka
+  namespace: vss-alerts
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kafka
+  template:
+    metadata:
+      labels:
+        app: kafka
+    spec:
+      enableServiceLinks: false
+      imagePullSecrets:
+        - name: nvcr-secret
+      containers:
+        - name: kafka
+          image: confluentinc/cp-kafka:8.1.1
+          ports:
+            - containerPort: 9092
+            - containerPort: 9093
+          env:
+            - name: KAFKA_BROKER_ID
+              value: "1"
+            - name: KAFKA_PROCESS_ROLES
+              value: "broker,controller"
+            - name: KAFKA_NODE_ID
+              value: "1"
+            - name: KAFKA_CONTROLLER_QUORUM_VOTERS
+              value: "1@localhost:9093"
+            - name: KAFKA_LISTENERS
+              value: "PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093"
+            # Must be reachable by all pods — use the K8s service DNS name
+            - name: KAFKA_ADVERTISED_LISTENERS
+              value: "PLAINTEXT://kafka:9092"
+            - name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP
+              value: "PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT"
+            - name: KAFKA_INTER_BROKER_LISTENER_NAME
+              value: "PLAINTEXT"
+            - name: KAFKA_CONTROLLER_LISTENER_NAMES
+              value: "CONTROLLER"
+            - name: KAFKA_AUTO_CREATE_TOPICS_ENABLE
+              value: "false"
+            - name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR
+              value: "1"
+            - name: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR
+              value: "1"
+            - name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR
+              value: "1"
+            - name: KAFKA_HEAP_OPTS
+              value: "-Xmx6G -Xms6G"
+            - name: KAFKA_MAX_REQUEST_SIZE
+              value: "10485760"
+            - name: KAFKA_MESSAGE_MAX_BYTES
+              value: "10485760"
+            - name: KAFKA_MAX_PARTITION_FETCH_BYTES
+              value: "10485760"
+            - name: KAFKA_REPLICA_FETCH_MAX_BYTES
+              value: "10485760"
+            - name: KAFKA_LOG_DIRS
+              value: "/tmp/kafka-data"
+            - name: CLUSTER_ID
+              value: "KmvsFTucSYOV5BPqlgB__Q"
+          volumeMounts:
+            - name: kafka-data
+              mountPath: /tmp/kafka-data
+          livenessProbe:
+            tcpSocket:
+              port: 9092
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            failureThreshold: 5
+            timeoutSeconds: 5
+          readinessProbe:
+            tcpSocket:
+              port: 9092
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            failureThreshold: 10
+            timeoutSeconds: 5
+          resources:
+            requests:
+              memory: "8Gi"
+              cpu: "2"
+            limits:
+              memory: "10Gi"
+              cpu: "4"
+      volumes:
+        - name: kafka-data
+          persistentVolumeClaim:
+            claimName: kafka-data
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka
+  namespace: vss-alerts
+spec:
+  selector:
+    app: kafka
+  ports:
+    - name: plaintext
+      port: 9092
+      targetPort: 9092
+    - name: controller
+      port: 9093
+      targetPort: 9093
+
+---
+# ── Elasticsearch ──────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: elasticsearch
+  namespace: vss-alerts
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: elasticsearch
+  template:
+    metadata:
+      labels:
+        app: elasticsearch
+    spec:
+      imagePullSecrets:
+        - name: nvcr-secret
+      initContainers:
+        - name: fix-permissions
+          image: busybox
+          command: ["sh", "-c", "chmod 777 /tmp/elastic/data /tmp/elastic/logs"]
+          volumeMounts:
+            - name: es-data
+              mountPath: /tmp/elastic/data
+              subPath: data
+            - name: es-data
+              mountPath: /tmp/elastic/logs
+              subPath: logs
+      containers:
+        - name: elasticsearch
+          # Build: docker build -f deployments/foundational/Dockerfiles/elasticsearch.Dockerfile .
+          # If you cannot build the custom image, use docker.elastic.co/elasticsearch/elasticsearch:8.17.0
+          # and mount your elasticsearch.yml via ConfigMap
+          image: CHANGE_ME_YOUR_REGISTRY/vss-elasticsearch:3.1.0
+          ports:
+            - containerPort: 9200
+          env:
+            - name: ES_JAVA_OPTS
+              value: "-Xmx1024m -Xms256m"
+            - name: discovery.type
+              value: "single-node"
+            - name: xpack.security.enabled
+              value: "false"
+          volumeMounts:
+            - name: es-data
+              mountPath: /tmp/elastic/data
+              subPath: data
+            - name: es-data
+              mountPath: /tmp/elastic/logs
+              subPath: logs
+          livenessProbe:
+            httpGet:
+              path: /_cluster/health
+              port: 9200
+            initialDelaySeconds: 45
+            periodSeconds: 20
+            failureThreshold: 10
+          readinessProbe:
+            httpGet:
+              path: /_cluster/health
+              port: 9200
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 15
+          resources:
+            requests:
+              memory: "2Gi"
+              cpu: "1"
+            limits:
+              memory: "3Gi"
+              cpu: "2"
+      volumes:
+        - name: es-data
+          persistentVolumeClaim:
+            claimName: elasticsearch-data
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: elasticsearch
+  namespace: vss-alerts
+spec:
+  selector:
+    app: elasticsearch
+  ports:
+    - port: 9200
+      targetPort: 9200
+
+---
+# ── Redis ──────────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: vss-alerts
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:8.2.2-alpine
+          command: ["redis-server", "/config/redis.conf"]
+          ports:
+            - containerPort: 6379
+          volumeMounts:
+            - name: redis-config
+              mountPath: /config/redis.conf
+              subPath: redis.conf
+            - name: redis-data
+              mountPath: /data
+              subPath: data
+            - name: redis-data
+              mountPath: /log
+              subPath: log
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "1Gi"
+              cpu: "500m"
+      volumes:
+        - name: redis-config
+          configMap:
+            name: redis-config
+        - name: redis-data
+          persistentVolumeClaim:
+            claimName: redis-data
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: vss-alerts
+spec:
+  selector:
+    app: redis
+  ports:
+    - port: 6379
+      targetPort: 6379
+
+---
+# ── Kibana ─────────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kibana
+  namespace: vss-alerts
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kibana
+  template:
+    metadata:
+      labels:
+        app: kibana
+    spec:
+      containers:
+        - name: kibana
+          image: docker.elastic.co/kibana/kibana:9.3.0
+          ports:
+            - containerPort: 5601
+          env:
+            - name: ELASTICSEARCH_HOSTS
+              value: "http://elasticsearch:9200"
+            - name: SERVER_PUBLICBASEURL
+              value: "http://CHANGE_ME_HOST_IP:5601"
+            - name: SERVER_SECURITYRESPONSEHEADERS_DISABLEEMBEDDING
+              value: "false"
+            - name: CSP_STRICT
+              value: "false"
+          readinessProbe:
+            httpGet:
+              path: /api/status
+              port: 5601
+            initialDelaySeconds: 60
+            periodSeconds: 15
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /api/status
+              port: 5601
+            initialDelaySeconds: 90
+            periodSeconds: 30
+            failureThreshold: 5
+          resources:
+            requests:
+              memory: "1Gi"
+              cpu: "500m"
+            limits:
+              memory: "2Gi"
+              cpu: "1"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kibana
+  namespace: vss-alerts
+spec:
+  selector:
+    app: kibana
+  type: NodePort
+  ports:
+    - port: 5601
+      targetPort: 5601
+      nodePort: 30561  # access at http://<NODE_IP>:30561
+
+---
+# ── Logstash ───────────────────────────────────────────────────────────────
+# NOTE: Logstash mounts protobuf binary descriptors and custom gems
+#       from deployments/foundational/elk/. Create a ConfigMap or
+#       pre-populate a PVC with those files. This manifest mounts them
+#       from the same PVC as the app source (models-data as placeholder).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: logstash
+  namespace: vss-alerts
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: logstash
+  template:
+    metadata:
+      labels:
+        app: logstash
+    spec:
+      imagePullSecrets:
+        - name: nvcr-secret
+      containers:
+        - name: logstash
+          image: docker.elastic.co/logstash/logstash:9.3.0
+          env:
+            - name: LS_JAVA_OPTS
+              value: "-Xmx1024m -Xms256m"
+            - name: STREAM_TYPE
+              value: "kafka"
+          # Logstash config and protobuf files must be mounted here.
+          # See deployments/foundational/elk/ for source files.
+          # Mount them via ConfigMap (for .conf/.yml) and initContainer
+          # (to copy binary .desc files from repo into the pod).
+          resources:
+            requests:
+              memory: "2Gi"
+              cpu: "500m"
+            limits:
+              memory: "3Gi"
+              cpu: "1"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: logstash
+  namespace: vss-alerts
+spec:
+  selector:
+    app: logstash
+  ports:
+    - port: 5044
+      targetPort: 5044
+
+---
+# ── Phoenix (Telemetry) ────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: phoenix
+  namespace: vss-alerts
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: phoenix
+  template:
+    metadata:
+      labels:
+        app: phoenix
+    spec:
+      containers:
+        - name: phoenix
+          image: arizephoenix/phoenix:version-8.12.1
+          ports:
+            - containerPort: 6006
+          env:
+            - name: PHOENIX_WORKING_DIR
+              value: "/.phoenix/"
+            # K8s injects PHOENIX_PORT=tcp://... from the service; override with an integer
+            - name: PHOENIX_PORT
+              value: "6006"
+          volumeMounts:
+            - name: phoenix-data
+              mountPath: /.phoenix
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "1Gi"
+              cpu: "500m"
+      volumes:
+        - name: phoenix-data
+          persistentVolumeClaim:
+            claimName: phoenix-data
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: phoenix
+  namespace: vss-alerts
+spec:
+  selector:
+    app: phoenix
+  type: NodePort
+  ports:
+    - port: 6006
+      targetPort: 6006
+      nodePort: 30606  # access at http://<NODE_IP>:30606
+
+---
+# ── PostgreSQL (for VST) ───────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: vss-alerts
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:17.6-alpine
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              value: "vst"
+            - name: POSTGRES_DB
+              value: "nvcentralizedb"
+            - name: POSTGRES_HOST_AUTH_METHOD
+              value: "trust"
+          volumeMounts:
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "vst", "-d", "nvcentralizedb"]
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 60
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "vst", "-d", "nvcentralizedb"]
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 5
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "1Gi"
+              cpu: "500m"
+      volumes:
+        - name: postgres-data
+          persistentVolumeClaim:
+            claimName: postgres-data
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: vss-alerts
+spec:
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+
+---
+# ---------------------------------------------------------------------------
+# 7. VST SERVICES (Video Storage Tool)
+# ---------------------------------------------------------------------------
+
+# ── VST Stream Processing (SDR inside VST) ─────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vst-stream-processing
+  namespace: vss-alerts
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vst-stream-processing
+  template:
+    metadata:
+      labels:
+        app: vst-stream-processing
+    spec:
+      imagePullSecrets:
+        - name: nvcr-secret
+      containers:
+        - name: vst-stream-processing
+          image: nvcr.io/nvidia/vss-core/vss-vios-streamprocessing:3.1.0
+          ports:
+            - containerPort: 9010
+          env:
+            - name: HOST_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "2Gi"
+              cpu: "1"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vst-stream-processing
+  namespace: vss-alerts
+spec:
+  selector:
+    app: vst-stream-processing
+  ports:
+    - port: 9010
+      targetPort: 9010
+
+---
+# ── SDR — Stream Data Router / Workload Manager ────────────────────────────
+# Bridges VST stream events to DeepStream perception via Docker socket.
+# Watches VST for new RTSP streams and sends stream configs to DeepStream.
+# NOTE: In K8s the perception container is already running as a pod; the SDR
+# handles stream add/remove but cannot spawn new Docker containers for perception
+# (K8s manages perception pod lifecycle). Mount Docker socket for host-level access.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: perception-sdr
+  namespace: vss-alerts
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: perception-sdr
+  template:
+    metadata:
+      labels:
+        app: perception-sdr
+    spec:
+      imagePullSecrets:
+        - name: nvcr-secret
+      containers:
+        - name: perception-sdr
+          image: nvcr.io/nvidia/vss-core/sdr:3.1.0
+          ports:
+            - containerPort: 4001
+          env:
+            - name: PORT
+              value: "4001"
+            - name: OTEL_SDK_DISABLED
+              value: "true"
+            - name: WDM_INITIALIZE_FROM_VST
+              value: "true"
+            - name: WDM_WL_SPEC
+              value: "/wdm-data/ds-data_wl.yaml"
+            - name: WDM_CLUSTER_CONFIG_FILE
+              value: "/wdm-configs/docker_cluster_config.json"
+            - name: WDM_MSG_KEY
+              value: "vst.event"
+            - name: WDM_WL_REDIS_MSG_FIELD
+              value: "sensor.id"
+            - name: WDM_WL_ADD_URL
+              value: "/api/v1/stream/add"
+            - name: WDM_WL_DELETE_URL
+              value: "/api/v1/stream/remove"
+            - name: WDM_WL_HEALTH_CHECK_URL
+              value: "/api/v1/stream/add"
+            - name: VST_STREAMS_ENDPOINT
+              value: "http://vst-ingress:30888/vst/api/v1/live/streams"
+            - name: VST_STATUS_ENDPOINT
+              value: "http://vst-ingress:30888/vst/api/v1/sensor/status"
+            - name: WDM_WL_CHANGE_ID_ADD
+              value: "camera_streaming"
+            - name: WDM_CLEAR_DATA_WL
+              value: "true"
+            - name: WDM_CLUSTER_CONTAINER_NAMES
+              value: '["perception-alerts"]'
+          volumeMounts:
+            - name: sdr-config
+              mountPath: /wdm-configs/docker_cluster_config.json
+              subPath: docker_cluster_config.json
+            - name: sdr-data
+              mountPath: /wdm-data
+            - name: docker-socket
+              mountPath: /var/run/docker.sock
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+      volumes:
+        - name: sdr-config
+          configMap:
+            name: sdr-config
+        - name: sdr-data
+          emptyDir: {}
+        - name: docker-socket
+          hostPath:
+            path: /var/run/docker.sock
+            type: Socket
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: perception-sdr
+  namespace: vss-alerts
+spec:
+  selector:
+    app: perception-sdr
+  ports:
+    - port: 4001
+      targetPort: 4001
+
+---
+# ── VST Envoy (gRPC proxy for stream processing) ───────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vst-envoy
+  namespace: vss-alerts
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vst-envoy
+  template:
+    metadata:
+      labels:
+        app: vst-envoy
+    spec:
+      imagePullSecrets:
+        - name: nvcr-secret
+      containers:
+        - name: envoy
+          image: nvcr.io/nvidia/vss-core/envoy-proxy:3.1.0
+          ports:
+            - containerPort: 9011
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vst-envoy
+  namespace: vss-alerts
+spec:
+  selector:
+    app: vst-envoy
+  ports:
+    - port: 9011
+      targetPort: 9011
+
+---
+# ── VST Sensor ─────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vst-sensor
+  namespace: vss-alerts
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vst-sensor
+  template:
+    metadata:
+      labels:
+        app: vst-sensor
+    spec:
+      imagePullSecrets:
+        - name: nvcr-secret
+      securityContext:
+        runAsUser: 0
+      containers:
+        - name: vst-sensor
+          image: nvcr.io/nvidia/vss-core/vss-vios-sensor:3.1.0
+          ports:
+            - containerPort: 30000
+          env:
+            - name: ADAPTOR
+              value: "vst_rtsp"
+            - name: NEED_RECORDING
+              value: "false"
+            - name: NEED_RTSPSERVER
+              value: "false"
+            - name: NEED_STORAGE
+              value: "false"
+            - name: NEED_STREAM_MONITORING
+              value: "true"
+            - name: HTTP_PORT
+              value: "30000"
+            - name: CENTRALIZE_DB_NAME
+              value: "nvcentralizedb"
+            - name: CENTRALIZE_DB_USERNAME
+              value: "vst"
+            - name: STREAM_PROCESSOR_MODULE_ENDPOINT
+              value: "http://vst-stream-processing:9010"
+          volumeMounts:
+            - name: vst-data
+              mountPath: /home/vst/vst_release/vst_data
+              subPath: vst_data
+            - name: vst-data
+              mountPath: /home/vst/vst_release/vst_video
+              subPath: vst_video
+          readinessProbe:
+            tcpSocket:
+              port: 30000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 20
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "2Gi"
+              cpu: "1"
+      volumes:
+        - name: vst-data
+          persistentVolumeClaim:
+            claimName: vst-data
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vst-sensor
+  namespace: vss-alerts
+spec:
+  selector:
+    app: vst-sensor
+  ports:
+    - port: 30000
+      targetPort: 30000
+
+---
+# ── VST Ingress (nginx, exposes VST REST API on 30888) ─────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vst-ingress
+  namespace: vss-alerts
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vst-ingress
+  template:
+    metadata:
+      labels:
+        app: vst-ingress
+    spec:
+      imagePullSecrets:
+        - name: nvcr-secret
+      securityContext:
+        runAsUser: 0
+      containers:
+        - name: vst-ingress
+          image: nvcr.io/nvidia/vss-core/vss-vios-ingress:3.1.0
+          ports:
+            - containerPort: 80
+          env:
+            - name: HOST_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            - name: VST_INGRESS_HTTP_PORT
+              value: "30888"
+          readinessProbe:
+            tcpSocket:
+              port: 80
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 30
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vst-ingress
+  namespace: vss-alerts
+spec:
+  selector:
+    app: vst-ingress
+  type: NodePort
+  ports:
+    - port: 30888
+      targetPort: 80
+      nodePort: 30888  # access VST UI at http://<NODE_IP>:30888/vst/#/dashboard
+
+---
+# ── VST MCP Server ─────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vst-mcp
+  namespace: vss-alerts
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vst-mcp
+  template:
+    metadata:
+      labels:
+        app: vst-mcp
+    spec:
+      imagePullSecrets:
+        - name: nvcr-secret
+      securityContext:
+        runAsUser: 0
+      containers:
+        - name: vst-mcp
+          image: nvcr.io/nvidia/vss-core/vss-vios-mcp:3.1.0
+          ports:
+            - containerPort: 8001
+          env:
+            - name: MCP_GATEWAY_CPP_API_BASE_URL
+              value: "http://vst-ingress:30888"
+            - name: MCP_GATEWAY_CPP_API_TIMEOUT
+              value: "30"
+            - name: MCP_GATEWAY_SERVER_NAME
+              value: "vst-mcp-server"
+            - name: MCP_GATEWAY_SERVER_VERSION
+              value: "1.0.0"
+            - name: MCP_GATEWAY_SERVER_HOST
+              value: "0.0.0.0"
+            - name: MCP_GATEWAY_SERVER_PORT
+              value: "8001"
+            - name: MCP_GATEWAY_LOG_LEVEL
+              value: "INFO"
+            - name: MCP_GATEWAY_ENABLE_JSONRPC_LOGGING
+              value: "true"
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vst-mcp
+  namespace: vss-alerts
+spec:
+  selector:
+    app: vst-mcp
+  ports:
+    - port: 8001
+      targetPort: 8001
+
+---
+# ---------------------------------------------------------------------------
+# 8. NVSTREAMER (video playback / RTSP server)
+# ---------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nvstreamer
+  namespace: vss-alerts
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nvstreamer
+  template:
+    metadata:
+      labels:
+        app: nvstreamer
+    spec:
+      imagePullSecrets:
+        - name: nvcr-secret
+      securityContext:
+        runAsUser: 0
+      containers:
+        - name: nvstreamer
+          image: nvcr.io/nvidia/vss-core/vss-vios-nvstreamer:3.1.0
+          ports:
+            - containerPort: 31000   # HTTP
+            - containerPort: 31554   # RTSP
+          env:
+            - name: NVSTREAMER_INSTALL_ADDITIONAL_PACKAGES
+              value: "true"
+            - name: ADAPTOR
+              value: "streamer"
+            - name: HTTP_PORT
+              value: "31000"
+          volumeMounts:
+            - name: nvstreamer-config
+              mountPath: /home/vst/vst_release/configs/vst_config.json
+              subPath: vst-config.json
+            - name: nvstreamer-config
+              mountPath: /home/vst/vst_release/configs/vst_storage.json
+              subPath: vst-storage.json
+            - name: nvstreamer-data
+              mountPath: /home/vst/vst_release/streamer_videos
+              subPath: videos
+            - name: nvstreamer-data
+              mountPath: /home/vst/vst_release/vst_data
+              subPath: vst_data
+          resources:
+            requests:
+              memory: "1Gi"
+              cpu: "500m"
+            limits:
+              memory: "4Gi"
+              cpu: "2"
+      volumes:
+        - name: nvstreamer-config
+          configMap:
+            name: nvstreamer-config
+        - name: nvstreamer-data
+          persistentVolumeClaim:
+            claimName: nvstreamer-data
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nvstreamer
+  namespace: vss-alerts
+spec:
+  selector:
+    app: nvstreamer
+  type: NodePort
+  ports:
+    - name: http
+      port: 31000
+      targetPort: 31000
+      nodePort: 31000  # NVStreamer UI at http://<NODE_IP>:31000
+    - name: rtsp
+      port: 31554
+      targetPort: 31554
+      nodePort: 31554
+
+---
+# ---------------------------------------------------------------------------
+# 9. PERCEPTION (DeepStream + GPU)
+# ---------------------------------------------------------------------------
+# NOTE: The perception-sdr (workload manager) mounts /var/run/docker.sock.
+# In Kubernetes, pod lifecycle is managed by K8s itself, so the SDR's role
+# of spawning/stopping DeepStream containers is not needed. The perception
+# Deployment below replaces that dynamic management. If you need the SDR's
+# stream-add/remove API at localhost:4001, deploy it with a hostPath volume
+# for the Docker socket AND grant the node privileged access — not recommended
+# for production. Consider using the K8s API via a custom controller instead.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: perception-alerts
+  namespace: vss-alerts
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: perception-alerts
+  template:
+    metadata:
+      labels:
+        app: perception-alerts
+    spec:
+      imagePullSecrets:
+        - name: nvcr-secret
+      runtimeClassName: nvidia   # required for GPU access
+      containers:
+        - name: perception
+          # Build: docker build -f deployments/developer-workflow/dev-profile-alerts/Dockerfiles/perception.Dockerfile \
+          #          --build-arg PERCEPTION_IMAGE=nvcr.io/nvidia/vss-core/vss-rt-cv \
+          #          --build-arg PERCEPTION_TAG=3.1.0 \
+          #          deployments/developer-workflow/dev-profile-alerts
+          image: CHANGE_ME_YOUR_REGISTRY/vss-perception-alerts:3.1.0
+          command:
+            - bash
+            - -c
+            - |
+              sed -i 's/msg-broker-conn-str=localhost;9092/msg-broker-conn-str=kafka;9092/g' run_config-api-rtdetr-protobuf.txt
+              exec bash ds-start.sh run_config-api-rtdetr-protobuf.txt
+          env:
+            - name: MODEL_TYPE
+              value: "cnn"
+            - name: STREAM_TYPE
+              value: "kafka"
+            - name: MODEL_NAME_2D
+              value: "GDINO"
+            - name: NUM_SENSORS
+              value: "CHANGE_ME_NUM_SENSORS"
+            # GPU device index for DeepStream.  Set RT_CV_DEVICE_ID in .env.
+            # Avoid GPU 0 if an MPS server is already running there (CUDA error 35).
+            - name: NVIDIA_VISIBLE_DEVICES
+              value: "CHANGE_ME_RT_CV_DEVICE_ID"
+          volumeMounts:
+            - name: models
+              mountPath: /opt/nvidia/deepstream/deepstream/sources/apps/sample_apps/metropolis_perception_app/models
+              readOnly: true
+            - name: perception-storage
+              mountPath: /opt/storage
+          resources:
+            limits:
+              nvidia.com/gpu: 1    # Perception GPU
+            requests:
+              memory: "4Gi"
+              cpu: "2"
+      volumes:
+        - name: models
+          hostPath:
+            path: /home/shadeform/video-search-and-summarization/deployments/data-dir/models
+            type: Directory
+        - name: perception-storage
+          persistentVolumeClaim:
+            claimName: perception-storage
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: perception-alerts
+  namespace: vss-alerts
+spec:
+  selector:
+    app: perception-alerts
+  ports:
+    - name: grpc
+      port: 9010
+      targetPort: 9010
+
+---
+# ---------------------------------------------------------------------------
+# 10. ANALYTICS SERVICES
+# ---------------------------------------------------------------------------
+
+# ── Behavior Analytics ──────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: behavior-analytics
+  namespace: vss-alerts
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: behavior-analytics
+  template:
+    metadata:
+      labels:
+        app: behavior-analytics
+    spec:
+      imagePullSecrets:
+        - name: nvcr-secret
+      containers:
+        - name: behavior-analytics
+          image: nvcr.io/nvidia/vss-core/vss-behavior-analytics:3.1.0
+          command:
+            - python3
+            - apps/dev_example/main_dev_example_app.py
+            - --config
+            - /resources/vss-behavior-analytics-config.json
+          volumeMounts:
+            - name: config
+              mountPath: /resources/vss-behavior-analytics-config.json
+              subPath: vss-behavior-analytics-config.json
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "2Gi"
+              cpu: "1"
+      volumes:
+        - name: config
+          configMap:
+            name: behavior-analytics-config
+
+---
+# ── Video Analytics API ─────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: video-analytics-api
+  namespace: vss-alerts
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: video-analytics-api
+  template:
+    metadata:
+      labels:
+        app: video-analytics-api
+    spec:
+      imagePullSecrets:
+        - name: nvcr-secret
+      containers:
+      initContainers:
+        - name: wait-for-es
+          image: curlimages/curl:8.5.0
+          command: ["sh", "-c", "until curl -sf http://elasticsearch:9200/_cluster/health; do sleep 5; done"]
+      containers:
+        - name: video-analytics-api
+          image: nvcr.io/nvidia/vss-core/vss-video-analytics-api:3.1.0
+          command:
+            - node
+            - index.js
+            - --config
+            - /opt/mdx/vss-video-analytics-api/configs/vss-video-analytics-api-config.json
+          ports:
+            - containerPort: 8081
+          volumeMounts:
+            - name: config
+              mountPath: /opt/mdx/vss-video-analytics-api/configs/vss-video-analytics-api-config.json
+              subPath: video-analytics-api-config.json
+            - name: api-data
+              mountPath: /web-api-app/files
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "1Gi"
+              cpu: "500m"
+      volumes:
+        - name: config
+          configMap:
+            name: video-analytics-api-config
+        - name: api-data
+          persistentVolumeClaim:
+            claimName: video-analytics-api-data
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: video-analytics-api
+  namespace: vss-alerts
+spec:
+  selector:
+    app: video-analytics-api
+  ports:
+    - port: 8081
+      targetPort: 8081
+
+---
+# ── Alert Verification (VLM-based alert clip verifier) ─────────────────────
+# Container entrypoint normally runs env-substitute.py to template config.yml
+# and write the result to /app/runtime/config.yml, then exec enhance_alert_with_vlm.py.
+# In K8s we skip env-substitute.py (values are pre-substituted in the ConfigMap)
+# and mount the resolved config directly at the expected runtime path.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alert-verification
+  namespace: vss-alerts
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: alert-verification
+  template:
+    metadata:
+      labels:
+        app: alert-verification
+    spec:
+      imagePullSecrets:
+        - name: nvcr-secret
+      initContainers:
+        - name: wait-for-deps
+          image: curlimages/curl:8.5.0
+          command:
+            - sh
+            - -c
+            - |
+              echo "Waiting for Elasticsearch..."
+              until curl -sf http://elasticsearch:9200/_cluster/health; do sleep 5; done
+              echo "Waiting for Kafka..."
+              until curl -sf http://kafka:9092 2>/dev/null || \
+                    nc -z kafka 9092 2>/dev/null; do sleep 5; done
+              echo "All deps ready"
+      containers:
+        - name: alert-verification
+          image: nvcr.io/nvidia/vss-core/vss-alert-verification:3.1.0
+          # Override the entrypoint — skip env-substitute.py since config is pre-resolved
+          command: ["python", "enhance_alert_with_vlm.py", "--config", "/app/runtime/config.yml"]
+          ports:
+            - containerPort: 9080
+          env:
+            - name: VLM_MODE
+              value: "local"
+            - name: VLM_BASE_URL
+              value: "http://vlm-nim:8000"
+            - name: VLM_NAME
+              value: "nvidia/cosmos-reason2-8b"
+          volumeMounts:
+            # Mount pre-resolved config at the path the app reads after env-substitution
+            - name: config
+              mountPath: /app/runtime/config.yml
+              subPath: config.yml
+            - name: config
+              mountPath: /app/alert_type_config.json
+              subPath: alert_type_config.json
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 9080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 12
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 9080
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            failureThreshold: 3
+          resources:
+            requests:
+              memory: "1Gi"
+              cpu: "500m"
+            limits:
+              memory: "2Gi"
+              cpu: "1"
+      volumes:
+        - name: config
+          configMap:
+            name: alert-verification-config
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alert-verification
+  namespace: vss-alerts
+spec:
+  selector:
+    app: alert-verification
+  ports:
+    - port: 9080
+      targetPort: 9080
+
+---
+# ---------------------------------------------------------------------------
+# 11. NIM MODELS (GPU-intensive; very long startup times)
+# ---------------------------------------------------------------------------
+
+# ── LLM NIM — nvidia-nemotron-nano-9b-v2 (GPU 1) ──────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llm-nim
+  namespace: vss-alerts
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: llm-nim
+  template:
+    metadata:
+      labels:
+        app: llm-nim
+    spec:
+      imagePullSecrets:
+        - name: nvcr-secret
+      runtimeClassName: nvidia
+      containers:
+        - name: llm-nim
+          image: nvcr.io/nim/nvidia/nvidia-nemotron-nano-9b-v2:1
+          ports:
+            - containerPort: 8000
+          env:
+            - name: NGC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: vss-secrets
+                  key: NGC_CLI_API_KEY
+            - name: PYTORCH_CUDA_ALLOC_CONF
+              value: "expandable_segments:True"
+            - name: NVIDIA_VISIBLE_DEVICES
+              value: "CHANGE_ME_LLM_DEVICE_ID"
+            - name: NIM_MAX_MODEL_LEN
+              value: "32768"
+          volumeMounts:
+            - name: nim-cache
+              mountPath: /opt/nim/.cache
+              readOnly: false
+            - name: dshm
+              mountPath: /dev/shm
+          # NIM containers take 10-20 min on first start (model download/compile)
+          startupProbe:
+            httpGet:
+              path: /v1/health/ready
+              port: 8000
+            failureThreshold: 130   # 130 × 10s = ~22 min
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /v1/health/live
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            failureThreshold: 5
+          livenessProbe:
+            httpGet:
+              path: /v1/health/live
+              port: 8000
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            failureThreshold: 3
+          resources:
+            limits:
+              nvidia.com/gpu: 2    # LLM: 2 GPUs for tensor parallelism (Mamba state cache too large for 1 GPU)
+              memory: "60Gi"
+            requests:
+              memory: "40Gi"
+              cpu: "4"
+      volumes:
+        - name: nim-cache
+          hostPath:
+            path: /var/lib/docker/volumes/mdx_nvidia_nemotron_nano_9b_v2_cache/_data
+            type: Directory
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: llm-nim
+  namespace: vss-alerts
+spec:
+  selector:
+    app: llm-nim
+  ports:
+    - port: 8000
+      targetPort: 8000
+
+---
+# ── VLM NIM — cosmos-reason2-8b (GPU 2) ───────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vlm-nim
+  namespace: vss-alerts
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vlm-nim
+  template:
+    metadata:
+      labels:
+        app: vlm-nim
+    spec:
+      imagePullSecrets:
+        - name: nvcr-secret
+      runtimeClassName: nvidia
+      containers:
+        - name: vlm-nim
+          image: nvcr.io/nim/nvidia/cosmos-reason2-8b:1.6.0
+          ports:
+            - containerPort: 8000
+          env:
+            - name: NGC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: vss-secrets
+                  key: NGC_CLI_API_KEY
+            - name: PYTORCH_CUDA_ALLOC_CONF
+              value: "expandable_segments:True"
+            - name: NIM_RELAX_MEM_CONSTRAINTS
+              value: "1"
+            - name: NVIDIA_VISIBLE_DEVICES
+              value: "CHANGE_ME_VLM_DEVICE_ID"
+            # Keep 70% of VRAM for KV cache
+            - name: NIM_TENSOR_PARALLEL_SIZE
+              value: "1"
+          volumeMounts:
+            - name: nim-cache
+              mountPath: /opt/nim/.cache
+            - name: dshm
+              mountPath: /dev/shm
+          startupProbe:
+            httpGet:
+              path: /v1/health/ready
+              port: 8000
+            failureThreshold: 130   # ~22 min for first-start model download
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /v1/health/live
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            failureThreshold: 5
+          livenessProbe:
+            httpGet:
+              path: /v1/health/live
+              port: 8000
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            failureThreshold: 3
+          resources:
+            limits:
+              nvidia.com/gpu: 1    # VLM GPU
+              memory: "40Gi"
+            requests:
+              memory: "30Gi"
+              cpu: "4"
+      volumes:
+        - name: nim-cache
+          hostPath:
+            path: /var/lib/docker/volumes/mdx_cosmos_reason2_8b_cache/_data
+            type: Directory
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vlm-nim
+  namespace: vss-alerts
+spec:
+  selector:
+    app: vlm-nim
+  ports:
+    - port: 8000
+      targetPort: 8000
+
+---
+# ---------------------------------------------------------------------------
+# 12. AGENT SERVICES
+# ---------------------------------------------------------------------------
+
+# ── VSS Agent MCP Server ───────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vss-agent-mcp
+  namespace: vss-alerts
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vss-agent-mcp
+  template:
+    metadata:
+      labels:
+        app: vss-agent-mcp
+    spec:
+      imagePullSecrets:
+        - name: nvcr-secret
+      containers:
+        - name: vss-agent-mcp
+          image: nvcr.io/nvidia/vss-core/vss-agent:3.1.0
+          # args overrides CMD, keeping the image's ENTRYPOINT (/vss-agent/.venv/bin/nat)
+          args:
+            - mcp
+            - serve
+            - --config_file
+            - /opt/config/va_mcp_server_config.yml
+            - --host
+            - "0.0.0.0"
+            - --port
+            - "9901"
+          ports:
+            - containerPort: 9901
+          env:
+            - name: VST_MCP_URL
+              value: "http://vst-mcp:8001"
+            - name: VSS_AGENT_HOST
+              value: "0.0.0.0"
+            - name: VSS_VA_MCP_PORT
+              value: "9901"
+          volumeMounts:
+            - name: mcp-config
+              mountPath: /opt/config/va_mcp_server_config.yml
+              subPath: va_mcp_server_config.yml
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "1Gi"
+              cpu: "500m"
+      volumes:
+        - name: mcp-config
+          configMap:
+            name: vss-agent-mcp-config
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vss-agent-mcp
+  namespace: vss-alerts
+spec:
+  selector:
+    app: vss-agent-mcp
+  ports:
+    - port: 9901
+      targetPort: 9901
+
+---
+# ── VSS Agent (main) ───────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vss-agent
+  namespace: vss-alerts
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vss-agent
+  template:
+    metadata:
+      labels:
+        app: vss-agent
+    spec:
+      imagePullSecrets:
+        - name: nvcr-secret
+      containers:
+        - name: vss-agent
+          image: nvcr.io/nvidia/vss-core/vss-agent:3.1.0
+          # args overrides CMD, keeping the image's ENTRYPOINT (/vss-agent/.venv/bin/nat)
+          args:
+            - serve
+            - --config_file
+            - /vss-agent/deployments/developer-workflow/dev-profile-alerts/vss-agent/configs/config.yml
+            - --host
+            - "0.0.0.0"
+            - --port
+            - "8000"
+          ports:
+            - containerPort: 8000
+          env:
+            # Networking
+            - name: HOST_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            - name: EXTERNAL_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            # LLM
+            - name: LLM_MODE
+              value: "local"
+            - name: LLM_NAME
+              value: "nvidia/nvidia-nemotron-nano-9b-v2"
+            - name: LLM_BASE_URL
+              value: "http://llm-nim:8000/v1"
+            - name: LLM_MODEL_TYPE
+              value: "nim"
+            # VLM
+            - name: VLM_MODE
+              value: "local"
+            - name: VLM_NAME
+              value: "nvidia/cosmos-reason2-8b"
+            - name: VLM_BASE_URL
+              value: "http://vlm-nim:8000/v1"
+            - name: VLM_MODEL_TYPE
+              value: "nim"
+            - name: RTVI_VLM_BASE_URL
+              value: "http://vlm-nim:8000"
+            # Agent config
+            - name: VSS_AGENT_CONFIG_FILE
+              value: "/vss-agent/deployments/developer-workflow/dev-profile-alerts/vss-agent/configs/config.yml"
+            - name: VSS_AGENT_HOST
+              value: "0.0.0.0"
+            - name: VSS_AGENT_PORT
+              value: "8000"
+            - name: VSS_AGENT_OBJECT_STORE_TYPE
+              value: "local_object_store"
+            - name: VSS_AGENT_EXTERNAL_URL
+              value: "http://vss-agent:8000"
+            - name: STREAM_MODE
+              value: "other"
+            # Service URLs
+            - name: VST_BASE_URL
+              value: "http://vst-ingress:30888"
+            - name: VST_INTERNAL_URL
+              value: "http://vst-ingress:30888"
+            - name: VST_EXTERNAL_URL
+              value: "http://vst-ingress:30888"
+            - name: VST_MCP_URL
+              value: "http://vst-mcp:8001"
+            - name: MDX_WEB_API_URL
+              value: "http://video-analytics-api:8081"
+            - name: VIDEO_ANALYSIS_MCP_URL
+              value: "http://vss-agent-mcp:9901"
+            - name: ELASTIC_SEARCH_ENDPOINT
+              value: "http://elasticsearch:9200"
+            - name: ELASTIC_SEARCH_INDEX
+              value: "mdx-vlm-incidents"
+            - name: PHOENIX_ENDPOINT
+              value: "http://phoenix:6006"
+            # API keys
+            - name: NVIDIA_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: vss-secrets
+                  key: NVIDIA_API_KEY
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: vss-secrets
+                  key: OPENAI_API_KEY
+            - name: VSS_AGENT_REPORTS_BASE_URL
+              value: "http://CHANGE_ME_HOST_IP:30801/static/"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 60
+            periodSeconds: 15
+            failureThreshold: 16  # 4 min grace
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 120
+            periodSeconds: 30
+            failureThreshold: 5
+          volumeMounts:
+            - name: app-configs
+              mountPath: /vss-agent/deployments
+              readOnly: true
+            - name: agent-eval
+              mountPath: /vss-agent/agent_eval
+          resources:
+            requests:
+              memory: "2Gi"
+              cpu: "1"
+            limits:
+              memory: "4Gi"
+              cpu: "2"
+      volumes:
+        - name: app-configs
+          hostPath:
+            path: /home/shadeform/video-search-and-summarization/deployments
+            type: Directory
+        - name: agent-eval
+          persistentVolumeClaim:
+            claimName: agent-eval
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vss-agent
+  namespace: vss-alerts
+spec:
+  type: NodePort
+  selector:
+    app: vss-agent
+  ports:
+    - port: 8000
+      targetPort: 8000
+      nodePort: 30801
+
+---
+# ── VSS Agent UI ───────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vss-agent-ui
+  namespace: vss-alerts
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vss-agent-ui
+  template:
+    metadata:
+      labels:
+        app: vss-agent-ui
+    spec:
+      imagePullSecrets:
+        - name: nvcr-secret
+      containers:
+        - name: vss-agent-ui
+          image: nvcr.io/nvidia/vss-core/vss-agent-ui:3.1.0
+          ports:
+            - containerPort: 3000
+          env:
+            # App branding
+            - name: NEXT_PUBLIC_APP_TITLE
+              value: "VSS BLUEPRINT"
+            - name: NEXT_PUBLIC_APP_SUBTITLE
+              value: "Vision (Alerts)"
+            - name: NEXT_PUBLIC_WORKFLOW
+              value: "VSS Agent"
+            # Backend endpoints — substitute NODE_IP at deploy time
+            # or use an Ingress controller for DNS routing
+            - name: VSS_AGENT_URL
+              value: "http://vss-agent:8000"
+            - name: VST_API_URL
+              value: "http://vst-ingress:30888"
+            - name: MDX_WEB_API_URL
+              value: "http://video-analytics-api:8081"
+            - name: KIBANA_BASE_URL
+              value: "http://kibana:5601"
+            # Feature flags
+            - name: NEXT_PUBLIC_ENABLE_CHAT_TAB
+              value: "true"
+            - name: NEXT_PUBLIC_CHAT_UPLOAD_FILE_ENABLE
+              value: "false"
+            - name: NEXT_PUBLIC_ENABLE_ALERTS_TAB
+              value: "true"
+            - name: NEXT_PUBLIC_ALERTS_TAB_VERIFIED_FLAG_DEFAULT
+              value: "true"
+            - name: NEXT_PUBLIC_ENABLE_DASHBOARD_TAB
+              value: "false"
+            - name: NEXT_PUBLIC_ENABLE_MAP_TAB
+              value: "false"
+            - name: NEXT_PUBLIC_ENABLE_VIDEO_MANAGEMENT_TAB
+              value: "true"
+            - name: NEXT_PUBLIC_VIDEO_MANAGEMENT_TAB_ADD_RTSP_ENABLE
+              value: "true"
+            - name: NEXT_PUBLIC_VIDEO_MANAGEMENT_VIDEO_UPLOAD_ENABLE
+              value: "false"
+            - name: NEXT_PUBLIC_ENABLE_SEARCH_TAB
+              value: "false"
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vss-agent-ui
+  namespace: vss-alerts
+spec:
+  selector:
+    app: vss-agent-ui
+  type: NodePort
+  ports:
+    - port: 3000
+      targetPort: 3000
+      nodePort: 30301  # VSS Agent UI at http://<NODE_IP>:30301
+
+---
+# =============================================================================
+# EXTERNAL PORTS SUMMARY
+# =============================================================================
+# Service              NodePort   URL
+# VSS Agent UI         30300      http://<NODE_IP>:30300
+# VST Dashboard        30888      http://<NODE_IP>:30888/vst/#/dashboard
+# NVStreamer UI        31000      http://<NODE_IP>:31000/#/dashboard
+# Kibana               30561      http://<NODE_IP>:30561/app/home#/
+# Phoenix              30606      http://<NODE_IP>:30606/projects
+#
+# =============================================================================
+# DEPLOYMENT ORDER (wait for each step before proceeding)
+# =============================================================================
+# 1. kubectl apply -f k8s-alert-verification.yaml   (creates all objects)
+# 2. Wait for infrastructure: kubectl -n vss-alerts rollout status deploy/kafka
+#    kubectl -n vss-alerts rollout status deploy/elasticsearch
+#    kubectl -n vss-alerts rollout status deploy/redis
+# 3. Wait for init jobs:
+#    kubectl -n vss-alerts wait --for=condition=complete job/kafka-topic-init --timeout=300s
+#    kubectl -n vss-alerts wait --for=condition=complete job/elasticsearch-init --timeout=300s
+# 4. Wait for NIM models (may take 20+ min on first start due to download):
+#    kubectl -n vss-alerts wait --for=condition=ready pod -l app=llm-nim --timeout=1800s
+#    kubectl -n vss-alerts wait --for=condition=ready pod -l app=vlm-nim --timeout=1800s
+# 5. Wait for VST:
+#    kubectl -n vss-alerts rollout status deploy/vst-sensor
+#    kubectl -n vss-alerts rollout status deploy/vst-ingress
+# 6. All other services start automatically.
+# 7. Run kibana-init job after kibana is ready:
+#    kubectl -n vss-alerts wait --for=condition=complete job/kibana-init --timeout=300s
+#
+# =============================================================================
+# TEARDOWN
+# =============================================================================
+# kubectl delete namespace vss-alerts
+# (PVCs are deleted with the namespace; PVs depend on your provisioner policy)
