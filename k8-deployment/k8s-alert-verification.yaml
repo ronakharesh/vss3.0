@@ -2004,6 +2004,7 @@ metadata:
   namespace: vss-alerts
 spec:
   replicas: 1
+  progressDeadlineSeconds: 1800
   selector:
     matchLabels:
       app: llm-nim
@@ -2098,6 +2099,7 @@ metadata:
   namespace: vss-alerts
 spec:
   replicas: 1
+  progressDeadlineSeconds: 1800
   selector:
     matchLabels:
       app: vlm-nim

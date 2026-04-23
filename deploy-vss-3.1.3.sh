@@ -237,6 +237,17 @@ install_k3s() {
 
   info "GPU Operator ready."
   kubectl get nodes -o custom-columns="NAME:.metadata.name,GPUs:.status.capacity.nvidia\.com/gpu"
+
+  # ── Start local Docker registry on localhost:5000 ──────────────────────────
+  # k3s on the same machine can pull from localhost:5000 without TLS config.
+  # This is the default YOUR_REGISTRY in .env.example.
+  if ! docker ps --format '{{.Names}}' | grep -q "^local-registry$"; then
+    info "Starting local Docker registry on localhost:5000..."
+    docker run -d -p 5000:5000 --restart=always --name local-registry registry:2
+    info "Local registry running at localhost:5000"
+  else
+    info "Local registry already running at localhost:5000"
+  fi
 }
 
 # ─── Namespace + secrets ─────────────────────────────────────────────────────
@@ -414,6 +425,30 @@ wait_for_pods() {
       && echo "done" || { echo "TIMEOUT/FAILED — check: kubectl -n $NAMESPACE logs job/$name"; return 1; }
   }
 
+  # NIM containers take 10-25 min first boot, 1-3 min warm cache.
+  # kubectl rollout status fails if progressDeadlineSeconds is exceeded before
+  # the pod becomes ready. Wait directly on pod readiness to avoid this.
+  _wait_nim() {
+    local name="$1" timeout="${2:-1500}"
+    echo -n "  [WAIT] nim/$name pod ready ... "
+    # Force a rollout restart if the deployment is stuck in ProgressDeadlineExceeded
+    local condition
+    condition=$(kubectl -n "$NAMESPACE" get deployment "$name" \
+      -o jsonpath='{.status.conditions[?(@.type=="Progressing")].reason}' 2>/dev/null || true)
+    if [[ "$condition" == "ProgressDeadlineExceeded" ]]; then
+      echo ""
+      warn "  $name deployment exceeded progress deadline — restarting to reset timer..."
+      kubectl -n "$NAMESPACE" rollout restart deployment/"$name"
+      sleep 5
+    fi
+    kubectl -n "$NAMESPACE" wait \
+      --for=condition=ready pod \
+      -l "app=$name" \
+      --timeout="${timeout}s" \
+      && echo "ready" \
+      || { echo "TIMEOUT — check: kubectl -n $NAMESPACE logs deployment/$name"; return 1; }
+  }
+
   info "Phase 1 — Core Infrastructure"
   _wait_deploy kafka            120
   _wait_deploy elasticsearch    180
@@ -448,8 +483,8 @@ wait_for_pods() {
 
   info "Phase 5 — NIM Models (first boot: 20-30 min, warm cache: 1-3 min)"
   warn "LLM NIM startup probe allows 22 min. If this was a fresh image pull, it may take longer."
-  _wait_deploy llm-nim 1500
-  _wait_deploy vlm-nim 1500
+  _wait_nim llm-nim 1500
+  _wait_nim vlm-nim 1500
 
   info "Phase 6 — Agent + UI"
   _wait_deploy vss-agent-mcp 120
