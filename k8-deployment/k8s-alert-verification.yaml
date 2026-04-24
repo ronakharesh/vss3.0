@@ -2035,6 +2035,12 @@ spec:
               value: "32768"
             - name: UCX_IB_DISABLE
               value: "1"
+            - name: UCX_TLS
+              value: "tcp,sm"
+            - name: OMPI_MCA_pml
+              value: "ob1"
+            - name: OMPI_MCA_btl
+              value: "tcp,self"
           volumeMounts:
             - name: nim-cache
               mountPath: /opt/nim/.cache
