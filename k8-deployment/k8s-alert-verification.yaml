@@ -2018,7 +2018,7 @@ spec:
       runtimeClassName: nvidia
       containers:
         - name: llm-nim
-          image: nvcr.io/nim/nvidia/nvidia-nemotron-nano-9b-v2:1
+          image: nvcr.io/nim/meta/llama-3.1-8b-instruct:latest
           ports:
             - containerPort: 8000
           env:
@@ -2029,18 +2029,6 @@ spec:
                   key: NGC_CLI_API_KEY
             - name: PYTORCH_CUDA_ALLOC_CONF
               value: "expandable_segments:True"
-            - name: NVIDIA_VISIBLE_DEVICES
-              value: "CHANGE_ME_LLM_DEVICE_ID"
-            - name: NIM_MAX_MODEL_LEN
-              value: "32768"
-            - name: UCX_IB_DISABLE
-              value: "1"
-            - name: UCX_TLS
-              value: "tcp,sm"
-            - name: OMPI_MCA_pml
-              value: "ob1"
-            - name: OMPI_MCA_btl
-              value: "tcp,self"
           volumeMounts:
             - name: nim-cache
               mountPath: /opt/nim/.cache
@@ -2070,15 +2058,15 @@ spec:
             failureThreshold: 3
           resources:
             limits:
-              nvidia.com/gpu: 2    # LLM: 2 GPUs for tensor parallelism (Mamba state cache too large for 1 GPU)
-              memory: "60Gi"
-            requests:
+              nvidia.com/gpu: 1    # Llama-3.1-8B FP8 fits on a single L40S (≥27 GB required)
               memory: "40Gi"
+            requests:
+              memory: "20Gi"
               cpu: "4"
       volumes:
         - name: nim-cache
           hostPath:
-            path: /var/lib/docker/volumes/mdx_nvidia_nemotron_nano_9b_v2_cache/_data
+            path: /var/lib/docker/volumes/mdx_llama_3_1_8b_instruct_cache/_data
             type: Directory
         - name: dshm
           emptyDir:
@@ -2315,7 +2303,7 @@ spec:
             - name: LLM_MODE
               value: "local"
             - name: LLM_NAME
-              value: "nvidia/nvidia-nemotron-nano-9b-v2"
+              value: "meta/llama-3.1-8b-instruct"
             - name: LLM_BASE_URL
               value: "http://llm-nim:8000/v1"
             - name: LLM_MODEL_TYPE
